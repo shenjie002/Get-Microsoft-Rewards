@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards (修复/增强版)
 // @namespace    https://github.com/Muverix/Get-Microsoft-Rewards
-// @version      1.0.6
+// @version      1.0.18
 // @description  微软 Rewards 自动助手：集成本地自动搜索、每日活动与自动签到。基于原脚本二次开发，在 Gemini AI 辅助下优化多区域兼容与卡片过滤逻辑。
 // @author       Muverix
 // @license      MIT
@@ -16,6 +16,8 @@
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @grant        GM_notification
 // @grant        GM_cookie
 // @grant        GM_registerMenuCommand
@@ -30,7 +32,7 @@
 // @connect      hot.baiwumm.com
 // @connect      hotapi.nntool.cc
 // @connect      cnxiaobai.com
-// @run-at       document-end
+// @run-at       document-start
 // ==/UserScript==
 
 /* =========================================================================
@@ -42,8 +44,52 @@
  * 4. 作者不对使用本脚本可能产生的任何风险（如账号积分变动或风控等）承担任何法律责任，请合理使用。
  * ========================================================================= */
 
-(function () {
+(async function () {
     'use strict';
+
+    const AUTH_PENDING_KEY = 'mr_oauth_pending_v1';
+    const AUTH_RESULT_KEY = 'mr_oauth_result_v1';
+    const AUTH_TTL = 10 * 60 * 1000;
+
+    function validAuthPending(pending, stateValue, now = Date.now()) {
+        return !!pending && typeof stateValue === 'string' && stateValue.length > 0
+            && pending.state === stateValue && typeof pending.scope === 'string'
+            && typeof pending.createdAt === 'number' && now >= pending.createdAt
+            && now - pending.createdAt < AUTH_TTL;
+    }
+
+    // 回调页必须在 UI、Cookie 身份检查和定时器之前处理。
+    // 不在微软登录页面运行任务，也不输出含 code 的 URL。
+    if (location.hostname === 'login.live.com') {
+        if (location.pathname === '/oauth20_desktop.srf') {
+            const callback = new URL(location.href);
+            const pending = GM_getValue(AUTH_PENDING_KEY, null);
+            const stateValue = callback.searchParams.get('state');
+            if (validAuthPending(pending, stateValue)) {
+                const code = callback.searchParams.get('code');
+                const error = callback.searchParams.get('error');
+                if (code || error) {
+                    GM_setValue(AUTH_RESULT_KEY, { state: stateValue, scope: pending.scope,
+                        code: code || '', failed: !!error, receivedAt: Date.now() });
+                    try { history.replaceState(null, '', location.pathname); } catch { }
+                    const showNotice = () => {
+                        const notice = document.createElement('div');
+                        notice.textContent = error ? '授权未完成，请返回 Rewards 页面重试。' : '授权结果已传回，请返回 Rewards 页面完成确认。此页面可以关闭。';
+                        (document.body || document.documentElement)?.appendChild(notice);
+                    };
+                    if (document.readyState === 'loading') {
+                        document.addEventListener('DOMContentLoaded', showNotice, { once: true });
+                    } else showNotice();
+                }
+            }
+        }
+        return;
+    }
+
+    // 回调先在 document-start 接收；普通页面等 DOM 就绪后再创建面板。
+    if (document.readyState === 'loading') {
+        await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, { once: true }));
+    }
 
     // ========== 配置 ==========
     const CONFIG = {
@@ -103,6 +149,226 @@
     let dashboard = null;
     let loginCookie = '';
 
+    // 以 Rewards 登录 Cookie 的摘要隔离登录会话。不保存原始 Cookie；
+    // 同一账号重新登录也可能得到新空间，宁可重新授权，不继承未知归属的缓存。
+    let accountScope = null;
+    let accountBlocked = false;
+    let identityCheck = null;
+    let identitySource = null;
+    let cookieIdentityUrl = null;
+    const identityCookieUrls = ['https://rewards.bing.com/'];
+    const pendingRequests = new Set();
+
+    // 不依赖 dashboard JSON 后面必须跟着 “; var”，并且不使用 eval。
+    function parseDashboard(html) {
+        const marker = /(?:\b(?:var|let|const)\s+dashboard|window\.__INITIAL_STATE__)\s*=\s*/g;
+        let match;
+        while ((match = marker.exec(html))) {
+            const start = marker.lastIndex;
+            if (html[start] !== '{') continue;
+            let depth = 0, quoted = false, escaped = false;
+            for (let i = start; i < html.length; i++) {
+                const c = html[i];
+                if (quoted) {
+                    if (escaped) escaped = false;
+                    else if (c === '\\') escaped = true;
+                    else if (c === '"') quoted = false;
+                } else if (c === '"') quoted = true;
+                else if (c === '{') depth++;
+                else if (c === '}' && --depth === 0) {
+                    try { return JSON.parse(html.slice(start, i + 1)); } catch { break; }
+                }
+            }
+        }
+        return null;
+    }
+
+    // 优先使用服务端仪表板的稳定身份；兼容不能使用 GM_cookie 的环境。
+    function dashboardIdentity(html) {
+        const data = parseDashboard(html);
+        if (!data) return null;
+        const profile = data.userProfile || {};
+        // 只接受明确的账号字段，不使用昵称、积分、活动 ID 等可能重复的数据。
+        for (const key of ['puid', 'PUID', 'cid', 'CID', 'userId']) {
+            const value = profile[key];
+            if (typeof value === 'string' && value.trim()) return `${key.toLowerCase()}:${value.trim().toLowerCase()}`;
+        }
+        return null;
+    }
+
+    async function fetchIdentityHtml() {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: `https://rewards.bing.com/dashboard?mr_identity=${Date.now()}`,
+                timeout: 15000,
+                onload: r => r.status === 200 ? resolve(r.responseText) : reject(new Error(`身份检查 HTTP ${r.status}`)),
+                onerror: () => reject(new Error('无法连接 Rewards 身份检查页面')),
+                ontimeout: () => reject(new Error('Rewards 身份检查超时'))
+            });
+        });
+    }
+
+    async function readAccountScope() {
+        let identity = null;
+        // 首次选定来源后不切换来源，避免短暂接口异常造成错误账号空间。
+        if (!identitySource || identitySource === 'dashboard') {
+            try {
+                identity = dashboardIdentity(await fetchIdentityHtml());
+                if (identity) identitySource = 'dashboard';
+            } catch (e) {
+                if (identitySource === 'dashboard') throw e;
+            }
+            if (identitySource === 'dashboard' && !identity) throw new Error('仪表板未返回账号身份，请确认 Rewards 已登录');
+        }
+        if (!identity) {
+            const urls = cookieIdentityUrl ? [cookieIdentityUrl] : identityCookieUrls;
+            for (const url of urls) {
+                const cookies = await getCookies(url);
+                const values = [...new Set(cookies.split(';').map(s => s.trim())
+                    .filter(s => s.startsWith('_U=')).map(s => s.slice(3)).filter(Boolean))];
+                if (values.length > 1) throw new Error('同一站点存在多个不同的登录 Cookie，请退出多余会话后重新登录');
+                if (values.length === 1) {
+                    cookieIdentityUrl = url;
+                    identity = `cookie:${url}:${values[0]}`;
+                    identitySource = 'cookie';
+                    break;
+                }
+            }
+            if (!identity) {
+                throw new Error('无法确认 Rewards 当前账号：页面身份字段无法解析，且 Rewards 下没有唯一登录凭证。已禁止回退使用 Bing 账号；不需要去 cn.bing.com 登录，请使用身份诊断继续排查 Rewards 页面');
+            }
+        }
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+        return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function showIdentityDiagnostics() {
+        const report = { version: '1.0.18', cookieApi: typeof GM_cookie };
+        nodes.panel.classList.remove('collapsed');
+        nodes.diagnose.disabled = true;
+        try {
+            // 只输出结构和状态，不输出身份字段值、Cookie 值、Token 或页面正文。
+            report.cookiesBySite = {};
+            for (const url of identityCookieUrls) {
+                report.cookiesBySite[url] = await new Promise(resolve => {
+                const timer = setTimeout(() => resolve({ status: 'timeout' }), 5000);
+                const done = value => { clearTimeout(timer); resolve(value); };
+                try {
+                    const callback = (cookies, error) => done({
+                        status: error ? 'api-error' : 'ok',
+                        names: [...new Set((cookies || []).map(c => c.name))],
+                        loginCookieCount: (cookies || []).filter(c => c.name === '_U').length
+                    });
+                    if (typeof GM_cookie === 'function') GM_cookie('list', { url }, callback);
+                    else if (typeof GM_cookie !== 'undefined' && typeof GM_cookie.list === 'function') GM_cookie.list({ url }, callback);
+                    else done({ status: 'unsupported' });
+                } catch { done({ status: 'api-exception' }); }
+                });
+            }
+            report.identitySource = identitySource;
+            report.cookieIdentitySite = cookieIdentityUrl;
+            report.page = await new Promise(resolve => {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: 'https://rewards.bing.com/dashboard', timeout: 15000,
+                    onload: r => {
+                        const data = parseDashboard(r.responseText || '');
+                        const keys = obj => obj && typeof obj === 'object' ? Object.keys(obj).slice(0, 60) : [];
+                        let host = '';
+                        try { host = new URL(r.finalUrl).hostname; } catch { }
+                        resolve({ status: r.status, finalHost: host, dashboardParsed: !!data,
+                            recognizedIdentity: !!dashboardIdentity(r.responseText || ''),
+                            rootFields: keys(data), profileFields: keys(data?.userProfile),
+                            statusFields: keys(data?.userStatus), profileAttributeFields: keys(data?.userProfile?.attributes) });
+                    },
+                    onerror: () => resolve({ status: 'network-error' }),
+                    ontimeout: () => resolve({ status: 'timeout' })
+                });
+            });
+            const box = document.createElement('textarea');
+            box.readOnly = true;
+            box.style.cssText = 'width:100%;height:180px;box-sizing:border-box;font-size:11px';
+            box.value = JSON.stringify(report, null, 2);
+            nodes.diagnosticOutput.replaceChildren(box);
+        } finally { nodes.diagnose.disabled = false; }
+    }
+
+    function blockAccount(reason) {
+        if (accountBlocked) return;
+        accountBlocked = true;
+        state.running = false;
+        state.accessToken = null;
+        state.accessTokenExpiresAt = 0;
+        if (state.pauseResolver) {
+            state.pauseResolver();
+            state.pauseResolver = null;
+            state.pausePromise = null;
+        }
+        dashboard = null;
+        for (const request of pendingRequests) request.abort();
+        pendingRequests.clear();
+        nodes.logBox.replaceChildren();
+        nodes.panel.classList.remove('collapsed');
+        nodes.account.textContent = '身份检查未通过';
+        nodes.points.textContent = '-';
+        nodes.pc.textContent = '-';
+        nodes.read.textContent = '-';
+        nodes.signStatus.textContent = '账号已变化';
+        nodes.level.textContent = '-';
+        nodes.pcBar.style.width = '0%';
+        nodes.readBar.style.width = '0%';
+        nodes.valPromo.textContent = '-';
+        for (const button of [nodes.btnAll, nodes.btnSearch, nodes.btnSign, nodes.btnRead, nodes.btnPromo, nodes.btnAuthSave]) button.disabled = true;
+        const notice = document.createElement('div');
+        notice.textContent = `⛔ 已暂停旧会话：${reason || '登录身份已变化'}。任务不会继续提交。`;
+        nodes.logBox.appendChild(notice);
+    }
+
+    async function assertAccount() {
+        if (accountBlocked) throw new Error('登录会话已失效，请刷新页面');
+        if (!identityCheck) {
+            identityCheck = (async () => {
+                try {
+                    const current = await readAccountScope();
+                    if (accountScope && current !== accountScope) throw new Error('微软登录身份已变化');
+                    accountScope = current;
+                } catch (e) {
+                    blockAccount(e.message);
+                    throw e;
+                }
+            })().finally(() => { identityCheck = null; });
+        }
+        await identityCheck;
+    }
+
+    function scopedKey(key) {
+        if (!accountScope || accountBlocked) throw new Error('当前账号尚未确认，请刷新页面');
+        return `mr_account_v3:${accountScope}:${key}`;
+    }
+    const accountGet = (key, fallback) => GM_getValue(scopedKey(key), fallback);
+    const accountSet = (key, value) => GM_setValue(scopedKey(key), value);
+
+    function clearAccountCache() {
+        if (!window.confirm('将停止本页任务，并清除此脚本所有账号的本地授权、签到、搜索记录及待处理授权。不会删除微软账号、浏览器 Cookie 或服务端积分。请先关闭其他运行本脚本的标签页。继续？')) return;
+        if (typeof GM_listValues !== 'function' || typeof GM_deleteValue !== 'function') {
+            window.alert('缺少存储管理权限，请完整重新安装此版脚本（包括顶部 @grant 声明）。');
+            return;
+        }
+        // 先锁住本页，避免在清理过程中继续提交或回写旧响应。
+        blockAccount('正在清除本地缓存');
+        const legacy = new Set(['refresh_token', 'auth_code', 'Config.lastSignDate', 'mr_search_progress', AUTH_PENDING_KEY, AUTH_RESULT_KEY]);
+        for (const key of GM_listValues()) {
+            if (key.startsWith('mr_account_v2:') || key.startsWith('mr_account_v3:') || legacy.has(key)) GM_deleteValue(key);
+        }
+        for (const key of Object.keys(sessionStorage)) {
+            if (key.startsWith('mr_account_v2:') || key.startsWith('mr_account_v3:') || key.startsWith('mr_auto_run_started_')) sessionStorage.removeItem(key);
+        }
+        sessionStorage.setItem('mr_require_manual_start', '1');
+        location.reload();
+    }
+
+    GM_registerMenuCommand('清除所有本地授权与任务缓存（切号排查）', clearAccountCache);
+
     // ========== 进度保存/恢复 ==========
     const STORAGE_KEY = 'mr_search_progress';
 
@@ -112,12 +378,12 @@
             date: today,
             searchCount: state.searchCount
         };
-        GM_setValue(STORAGE_KEY, JSON.stringify(data));
+        accountSet(STORAGE_KEY, JSON.stringify(data));
     }
 
     function loadProgress() {
     try {
-        const saved = GM_getValue(STORAGE_KEY);
+        const saved = accountGet(STORAGE_KEY);
         if (!saved) return null;
         const data = JSON.parse(saved);
         if (data.date === getDateHyphen()) {
@@ -177,7 +443,7 @@
     }
     function resetProgress() {
         state.searchCount = 0;
-        GM_setValue(STORAGE_KEY, '');
+        accountSet(STORAGE_KEY, '');
     }
 
     // ========== 工具函数 ==========
@@ -202,6 +468,7 @@
 
     // GM_xmlhttpRequest 封装
     async function gmRequest(options) {
+        await assertAccount();
         const retries = options.retries ?? 2;
         const retryDelay = options.retryDelay ?? 1000;
         let attempt = 0;
@@ -212,12 +479,16 @@
         };
 
         while (true) {
+            await assertAccount();
             try {
                 return await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
+                    const request = GM_xmlhttpRequest({
                         timeout: 20000,
                         ...options,
-                        onload: xhr => {
+                        onload: async xhr => {
+                            pendingRequests.delete(request);
+                            try { await assertAccount(); } catch (e) { reject(e); return; }
+                            if (accountBlocked) return reject(new Error('账号已切换，丢弃旧响应'));
                             if (xhr.status >= 200 && xhr.status < 300) {
                                 resolve(options.returnUrl ? xhr.finalUrl : xhr.responseText);
                             } else if (xhr.status >= 300 && xhr.status < 400) {
@@ -231,19 +502,27 @@
                                 reject(err);
                             }
                         },
+                        onabort: () => {
+                            pendingRequests.delete(request);
+                            reject(new Error('账号变化，请求已取消'));
+                        },
                         onerror: () => {
+                            pendingRequests.delete(request);
                             const err = new Error('Network Error');
                             err.status = 0;
                             reject(err);
                         },
                         ontimeout: () => {
+                            pendingRequests.delete(request);
                             const err = new Error('Timeout');
                             err.status = 0;
                             reject(err);
                         }
                     });
+                    pendingRequests.add(request);
                 });
             } catch (e) {
+                if (accountBlocked) throw e;
                 if (attempt >= retries || !shouldRetry(e)) throw e;
                 const delay = retryDelay * Math.pow(2, attempt);
                 attempt++;
@@ -274,8 +553,14 @@
         return `${randomPick(CONFIG.keywords)} ${Math.random().toString(36).slice(2, 6)}`;
     }
 
+    // Cookie API 对 @match 做 URL 匹配时也需要路径，不能传无尾斜杠的裸域名。
+    function cookieUrl(url) {
+        return new URL(url).href;
+    }
+
     // Cookie 管理
     function getCookies(url) {
+        url = cookieUrl(url);
     return new Promise(resolve => {
         try {
             if (typeof GM_cookie === 'undefined') {
@@ -283,7 +568,14 @@
                 return resolve('');
             }
 
-            GM_cookie.list({ url }, cookies => {
+            const list = typeof GM_cookie === 'function'
+                ? callback => GM_cookie('list', { url }, callback)
+                : callback => GM_cookie.list({ url }, callback);
+            list((cookies, error) => {
+                if (error) {
+                    console.warn('[Rewards] Cookie API 不可用:', String(error));
+                    return resolve('');
+                }
                 if (!cookies || !cookies.length) {
                     console.warn('[Rewards] Cookie为空:', url);
                     return resolve('');
@@ -307,7 +599,7 @@
     function deleteCookie(name, host = 'bing.com') {
         return new Promise(resolve => {
             if (typeof GM_cookie !== 'undefined') {
-                GM_cookie('delete', { url: `https://${host}`, name }, resolve);
+                GM_cookie('delete', { url: `https://${host}/`, name }, resolve);
             } else resolve();
         });
     }
@@ -420,6 +712,7 @@
 
             <div id="mr-body">
                 <!-- 状态 -->
+                <div class="mr-row"><span>网页会话标记（非账号）</span><span id="mr-account">待确认</span></div>
                 <div class="mr-row">
                     <span>等级 <span id="mr-level" style="font-weight:600">-</span></span>
                     <span style="color:#d83b01"><span id="mr-points">0</span> pts</span>
@@ -437,7 +730,7 @@
                 <!-- 授权 -->
                 <div id="mr-auth" style="display:none">
                     <div style="font-weight:bold;margin-bottom:5px">⚠️ 需授权</div>
-                    <button class="mr-btn" id="mr-auth-link" style="width:100%">🔗 获取授权码</button>
+                    <button class="mr-btn" id="mr-auth-link" style="width:100%">🔗 授权当前账号（自动接收）</button>
                     <input type="text" id="mr-auth-in" class="mr-input" placeholder="粘贴URL...">
                     <button class="mr-btn" id="mr-auth-save" style="width:100%">保存</button>
                 </div>
@@ -451,6 +744,9 @@
                     <button id="btn-all" class="mr-btn mr-full">🚀 一键全部执行</button>
                 </div>
 
+                <button id="mr-diagnose" class="mr-btn" style="width:100%;margin-top:8px">🔎 身份诊断（不含凭证）</button>
+                <button id="mr-clear-cache" class="mr-btn" style="width:100%;margin-top:8px">🧹 清除授权与缓存</button>
+                <div id="mr-diagnostic-output"></div>
                 <!-- 日志 -->
                 <div id="mr-log"></div>
             </div>
@@ -465,6 +761,7 @@
         close: $('#mr-close'),
         level: $('#mr-level'),
         points: $('#mr-points'),
+        account: $('#mr-account'),
         pc: $('#mr-pc'),
         pcBar: $('#mr-pc-bar'),
         signStatus: $('#mr-sign-status'),
@@ -480,8 +777,15 @@
         btnAuthLink: $('#mr-auth-link'),
         inAuth: $('#mr-auth-in'),
         btnAuthSave: $('#mr-auth-save'),
+        diagnose: $('#mr-diagnose'),
+        diagnosticOutput: $('#mr-diagnostic-output'),
         logBox: $('#mr-log')
     };
+
+    $('#mr-clear-cache').onclick = clearAccountCache;
+    nodes.diagnose.onclick = () => showIdentityDiagnostics().catch(() => {
+        nodes.diagnosticOutput.textContent = '诊断请求失败，请检查扩展的网站访问权限和网络。';
+    });
 
     // ========== 交互逻辑 ==========
 
@@ -498,6 +802,7 @@
 
     const LOG_MAX_LINES = 200;
     const log = (msg) => {
+        if (accountBlocked) return;
         const div = document.createElement('div');
         div.textContent = `[${new Date().toLocaleTimeString().slice(0, 5)}] ${msg}`;
         nodes.logBox.appendChild(div);
@@ -509,6 +814,11 @@
 
     const updateAllButton = () => {
         if (!nodes.btnAll) return;
+        if (accountBlocked) {
+            nodes.btnAll.disabled = true;
+            nodes.btnAll.textContent = '⛔ 请刷新页面';
+            return;
+        }
         if (state.manualPaused) {
             nodes.btnAll.textContent = '▶️ 继续执行';
         } else if (state.running || state.allRunning || state.busyCount > 0) {
@@ -544,43 +854,149 @@
     };
 
     const waitWhilePaused = async () => {
+        await assertAccount();
         if (!state.manualPaused) return 0;
         if (!state.pausePromise) {
             state.pausePromise = new Promise(resolve => { state.pauseResolver = resolve; });
         }
         const start = Date.now();
         await state.pausePromise;
+        await assertAccount();
         return Date.now() - start;
     };
 
     // 授权相关
-    const AUTH_URL = 'https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&response_type=code&redirect_uri=https://login.live.com/oauth20_desktop.srf';
+    const AUTH_URL = 'https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&response_type=code&redirect_uri=https://login.live.com/oauth20_desktop.srf&prompt=select_account';
 
-    nodes.btnAuthLink.onclick = () => window.open(AUTH_URL, '_blank');
+    let authPoll = null;
+    let authReceiving = false;
+
+    function confirmAuthorizationAccount() {
+        nodes.panel.classList.remove('collapsed');
+        const container = document.createElement('div');
+        container.style.cssText = 'padding:10px;background:#fff8e1;margin-top:8px';
+        const message = document.createElement('div');
+        message.textContent = '已收到一次性授权码，但它不包含可直接显示的账号信息，当前脚本无法展示或自动核对授权账号。请根据刚才微软账号选择页的选择自行确认；不确定时取消并重新选择，勿依据本面板旧积分判断。';
+        const yes = document.createElement('button');
+        yes.className = 'mr-btn';
+        yes.textContent = '我已在微软页面选择当前 Rewards 账号，继续';
+        const no = document.createElement('button');
+        no.className = 'mr-btn';
+        no.textContent = '取消此次授权';
+        container.append(message, yes, no);
+        nodes.boxAuth.style.display = 'block';
+        nodes.boxAuth.appendChild(container);
+        log('📥 已收到授权结果，请在面板中确认账号一致后完成授权');
+        return new Promise(resolve => {
+            let timer;
+            const finish = accepted => {
+                clearInterval(timer);
+                container.remove();
+                resolve(accepted);
+            };
+            yes.onclick = () => finish(!accountBlocked);
+            no.onclick = () => finish(false);
+            const expiresAt = Date.now() + 5 * 60 * 1000;
+            timer = setInterval(() => {
+                if (accountBlocked || Date.now() >= expiresAt) finish(false);
+            }, 1000);
+        });
+    }
+
+    async function acceptAuthorization(code) {
+        await assertAccount();
+        accountSet('auth_code', code);
+        accountSet('refresh_token', '');
+        state.accessToken = null;
+        state.accessTokenExpiresAt = 0;
+        nodes.inAuth.value = '';
+        log('🔑 正在兑换当前会话的授权...');
+        // 等待可能仍在运行的初始化 Token 请求完成，避免吞掉刚接收的授权码。
+        if (state.tokenPromise) await state.tokenPromise;
+        await assertAccount();
+        const token = await getAccessToken({ forceRefresh: true });
+        if (token) {
+            nodes.boxAuth.style.display = 'none';
+            log('🎉 授权成功！可以点击一键全部执行。');
+            await updateData();
+        } else {
+            nodes.boxAuth.style.display = 'block';
+            log('❌ 授权兑换失败，请重新授权');
+        }
+    }
+
+    nodes.btnAuthLink.onclick = async () => {
+        // 同步打开空白页，避免 await 后被浏览器当成弹窗拦截。
+        const popup = window.open('about:blank', '_blank');
+        if (!popup) { log('⚠️ 请允许此页面打开授权弹窗'); return; }
+        try {
+            await assertAccount();
+            const existing = GM_getValue(AUTH_PENDING_KEY, null);
+            if (existing && validAuthPending(existing, existing.state)) {
+                popup.close();
+                log('⚠️ 已有授权流程，请完成它或等待 10 分钟后重试');
+                return;
+            }
+            const pending = { state: crypto.randomUUID() + crypto.randomUUID(), scope: accountScope, createdAt: Date.now() };
+            GM_setValue(AUTH_RESULT_KEY, null);
+            GM_setValue(AUTH_PENDING_KEY, pending);
+            const target = new URL(AUTH_URL);
+            target.searchParams.set('state', pending.state);
+            popup.location.href = target.href;
+            log('🔗 请在新页面选择与 Rewards 一致的账号，授权结果将自动接收');
+            clearInterval(authPoll);
+            const finish = () => {
+                clearInterval(authPoll);
+                if (GM_getValue(AUTH_PENDING_KEY, null)?.state === pending.state) {
+                    GM_setValue(AUTH_PENDING_KEY, null);
+                    GM_setValue(AUTH_RESULT_KEY, null);
+                }
+            };
+            authPoll = setInterval(async () => {
+                if (authReceiving) return;
+                if (accountBlocked || Date.now() - pending.createdAt >= AUTH_TTL) {
+                    finish();
+                    if (!accountBlocked) log('⚠️ 授权已超时，请重新点击授权按钮');
+                    return;
+                }
+                const result = GM_getValue(AUTH_RESULT_KEY, null);
+                if (!result || result.state !== pending.state || result.scope !== pending.scope) return;
+                if (typeof result.receivedAt !== 'number' || result.receivedAt < pending.createdAt || result.receivedAt > Date.now()) return;
+                authReceiving = true;
+                try {
+                    await assertAccount();
+                    if (accountScope !== pending.scope) throw new Error('授权期间登录身份变化，结果已丢弃');
+                    finish();
+                    if (result.failed || !result.code) throw new Error('微软授权未完成，请重试');
+                    if (!await confirmAuthorizationAccount()) {
+                        log('ℹ️ 授权确认已取消或超时；尚未兑换 Token，请重新授权');
+                        return;
+                    }
+                    await acceptAuthorization(result.code);
+                } catch (e) {
+                    finish();
+                    log(`❌ 授权失败: ${e.message}`);
+                } finally { authReceiving = false; }
+            }, 1000);
+        } catch (e) {
+            popup.close();
+            log(`❌ 无法开始授权: ${e.message}`);
+        }
+    };
 
     nodes.btnAuthSave.onclick = async () => {
+        try { await assertAccount(); } catch (e) { log(e.message); return; }
         const val = nodes.inAuth.value.trim();
         try {
             const urlObj = new URL(val);
+            if (urlObj.origin !== 'https://login.live.com' || urlObj.pathname !== '/oauth20_desktop.srf') {
+                throw new Error('不是微软授权回调地址');
+            }
             const code = urlObj.searchParams.get('code');
             
             if (code) {
-                GM_setValue('auth_code', code);
-                GM_setValue('refresh_token', ''); // 清空旧 token
-                log('✅ 授权码已保存，正在尝试获取 Token...');
-                nodes.boxAuth.style.display = 'none';
-                nodes.inAuth.value = '';
-                
-                // 立即强制触发 Token 获取
-                const token = await getAccessToken({ forceRefresh: true });
-                if (token) {
-                    log('🎉 授权成功！');
-                    if (typeof updateData === 'function') {
-                        await updateData(); 
-                    }
-                } else {
-                    log('❌ 授权码兑换失败，请重新获取');
-                }
+                if (!await confirmAuthorizationAccount()) return;
+                await acceptAuthorization(code);
             } else {
                 log('❌ 格式错误：未在URL中找到 code 参数，请复制完整的白屏网址');
             }
@@ -590,46 +1006,7 @@
     };
     updateAllButton();
 
-    // 自动抓取微软 OAuth Code
-    async function checkAuth() {
-        // return null;//test
-        try {
-            let cookie = '';
-            if (typeof getCookies === 'function') {
-                cookie = await getCookies('https://login.live.com');
-            }
-
-            const authUrl = 'https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&response_type=code&redirect_uri=https://login.live.com/oauth20_desktop.srf';
-
-            const res = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: authUrl,
-                    headers: {
-                        'Cookie': cookie,
-                        'User-Agent': (typeof CONFIG !== 'undefined' && CONFIG.ua?.pc) ? CONFIG.ua.pc : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    },
-                    onload: r => resolve(r),
-                    onerror: e => reject(e)
-                });
-            });
-
-            // 1. 优先从跳转后的 URL 截取 code
-            const finalUrl = res.finalUrl || '';
-            let codeMatch = finalUrl.match(/[?&]code=([^&]+)/);
-            if (codeMatch) return decodeURIComponent(codeMatch[1]);
-
-            // 2. 次之从响应内容或 Header 截取
-            const body = res.responseText || '';
-            codeMatch = body.match(/[?&]code=([^&"'\s]+)/);
-            if (codeMatch) return decodeURIComponent(codeMatch[1]);
-
-            return null;
-        } catch (e) {
-            console.error('[Rewards] checkAuth 异常:', e);
-            return null;
-        }
-    }
+    // 不再静默抓取 OAuth Code：微软登录页可能保留另一个账号的会话。
 
     // ========== 核心逻辑 (简化版引用) ==========
 
@@ -671,13 +1048,7 @@
 
             let dashData = null;
 
-            if (htmlRes) {
-                const dashMatch = htmlRes.match(/var\s+dashboard\s*=\s*({[\s\S]*?});\s*var/i)
-                               || htmlRes.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/i);
-                if (dashMatch) {
-                    try { dashData = JSON.parse(dashMatch[1]); } catch (e) {}
-                }
-            }
+            if (htmlRes) dashData = parseDashboard(htmlRes);
 
             if (!dashData || !dashData.userProfile) {
                 try {
@@ -701,10 +1072,17 @@
             }
 
             if (!dashData) {
-                log('❌ 获取数据失败，请确认已登录 rewards.bing.com');
+                if (authReceiving) {
+                    log('ℹ️ 正在等待你确认授权账号；尚未兑换 Token，暂时无法读取接口数据');
+                } else if (!state.accessToken) {
+                    log('ℹ️ 网页数据结构未识别且尚无有效授权，请先完成面板授权；不代表网页未登录');
+                } else {
+                    log('⚠️ 无法获取 Rewards 数据：可能是接口或页面结构变化，请检查后再执行任务');
+                }
                 return;
             }
 
+            await assertAccount();
             dashboard = dashData;
 
             // =========================================================================
@@ -803,7 +1181,7 @@
             ];
 
             // 4. 签到状态解析
-            const lastSignDate = GM_getValue("Config.lastSignDate", "");
+            const lastSignDate = accountGet("Config.lastSignDate", "");
             const isLocalSigned = lastSignDate === today;
 
             let isRemoteSigned = false;
@@ -905,9 +1283,10 @@
 }
     // UI 渲染函数（精准适配原生节点映射）
     function render() {
-        if (!nodes.level) return;
+        if (accountBlocked || !nodes.level) return;
 
         // 1. 等级与积分（优先显示金牌/银牌名称）
+        nodes.account.textContent = accountScope ? `会话 ${accountScope.slice(0, 8)}` : '未确认';
         nodes.level.textContent = state.levelName || `Lv.${state.level}`;
         nodes.points.textContent = (state.points || 0).toLocaleString();
         // 2. 搜索进度
@@ -934,9 +1313,26 @@
         }
     }
 
+    function tokenFailureSummary(error) {
+        let data = {};
+        try { data = JSON.parse(error.responseText || '{}'); } catch { }
+        const allowed = new Set(['invalid_grant', 'invalid_request', 'invalid_client', 'unauthorized_client', 'access_denied', 'temporarily_unavailable', 'server_error', 'invalid_scope']);
+        const code = allowed.has(data.error) ? data.error : 'unknown_error';
+        const status = Number(error.status) || 0;
+        const hints = {
+            invalid_grant: '授权码可能已使用、过期或与请求不匹配，请重新发起授权',
+            invalid_client: '客户端配置被拒绝，不能靠反复授权解决',
+            invalid_scope: '微软接口不接受当前权限范围',
+            unauthorized_client: '该客户端不允许此授权方式',
+            access_denied: '微软拒绝授权'
+        };
+        return `HTTP ${status || '未知'} / ${code}：${hints[code] || '请检查网络或授权接口配置'}`;
+    }
+
     // Token 获取
     // 获取/刷新 OAuth Access Token
     async function getAccessToken(opts = {}) {
+        await assertAccount();
         const forceRefresh = !!opts.forceRefresh;
         const now = Date.now();
 
@@ -948,14 +1344,14 @@
             return state.tokenPromise;
         }
 
-        state.tokenPromise = (async () => {
+        state.tokenPromise = Promise.resolve().then(async () => {
             try {
                 if (forceRefresh) {
                     state.accessToken = null;
                     state.accessTokenExpiresAt = 0;
                 }
 
-                let refreshToken = GM_getValue('refresh_token', '');//test
+                let refreshToken = identitySource === 'dashboard' ? accountGet('refresh_token', '') : '';
                 let body = '';
 
                 if (refreshToken) {
@@ -964,21 +1360,22 @@
                     log('🔑 正在获取微软活动 Token...');
                     
                     // 1. 尝试静默获取
-                    let code = await checkAuth();
+                    // 新登录会话必须手动选择账号授权，不静默复用 login.live.com 的其他账号。
+                    let code = null;
                     
                     // 2. 静默获取失败，检查是否有手动保存的 auth_code
                     if (!code) {
-                        const savedCode = GM_getValue('auth_code', '');
+                        const savedCode = accountGet('auth_code', '');
                         if (savedCode) {
                             code = savedCode;
-                            GM_setValue('auth_code', ''); // 授权码是一次性的，取出后立即清空
+                            accountSet('auth_code', ''); // 授权码是一次性的，取出后立即清空
                             log('📥 已读取手动输入的授权码');
                         }
                     }
 
                     // 3. 仍然没有可用 code 时，弹出手动授权提示面板
                     if (!code) {
-                        log('⚠️ 静默授权失败，请点击面板中的“获取授权码”链接手动授权');
+                        log('⚠️ 当前登录会话需重新授权，请选择与 Rewards 网页一致的微软账号');
                         if (nodes.boxAuth) nodes.boxAuth.style.display = 'block';
                         return null;
                     }
@@ -986,22 +1383,25 @@
                     body = `client_id=0000000040170455&code=${encodeURIComponent(code)}&redirect_uri=https://login.live.com/oauth20_desktop.srf&grant_type=authorization_code`;
                 }
 
+                log('🔑 已发送授权兑换请求，等待微软响应...');
                 const res = await gmRequest({
                     method: 'POST',
                     url: 'https://login.live.com/oauth20_token.srf',
+                    retries: 0,
                     headers: {
                         'Content-Type': 'application/x-www-form-urlencoded'
                     },
                     data: body
                 });
 
+                await assertAccount();
                 const data = typeof res === 'string' ? JSON.parse(res) : res;
 
                 if (data.access_token) {
                     state.accessToken = data.access_token;
                     state.accessTokenExpiresAt = Date.now() + (Number(data.expires_in) || 3600) * 1000;
                     if (data.refresh_token) {
-                        GM_setValue('refresh_token', data.refresh_token);
+                        accountSet('refresh_token', data.refresh_token);
                     }
                     log('🔑 活动 Token 建立成功');
                     return data.access_token;
@@ -1009,19 +1409,19 @@
                     // 若旧 refresh_token 换取失败，清空并重新走 Code 授权
                     if (refreshToken) {
                         console.warn('[Rewards] RefreshToken 失效，尝试重新 Code 授权...');
-                        GM_setValue('refresh_token', '');
+                        accountSet('refresh_token', '');
                         state.tokenPromise = null;
                         return await getAccessToken({ forceRefresh: true });
                     }
-                    log('⚠️ Token 获取失败: ' + (data.error_description || data.error || '未知错误'));
+                    log('⚠️ Token 获取失败: ' + tokenFailureSummary({ responseText: JSON.stringify(data) }));
                 }
             } catch (e) {
-                log('❌ Auth Error: ' + e.message);
+                log('❌ 授权接口错误: ' + tokenFailureSummary(e));
             } finally {
                 state.tokenPromise = null;
             }
             return null;
-        })();
+        });
 
         return state.tokenPromise;
     }
@@ -1086,12 +1486,12 @@
 
                 if (act && pts > 0) {
                     log(`✅ App 签到成功 +${pts}分`);
-                    GM_setValue("Config.lastSignDate", getDateStr());
+                    accountSet("Config.lastSignDate", getDateStr());
                     state.checkedIn = true;
                     render();
                 } else if (response.isDuplicate || (act && pts === 0 && hasOfferId)) {
                     log('ℹ️ 今日已经完成过签到');
-                    GM_setValue("Config.lastSignDate", getDateStr());
+                    accountSet("Config.lastSignDate", getDateStr());
                     state.checkedIn = true;
                     render();
                 } else {
@@ -1689,6 +2089,7 @@ nodes.btnRead.onclick = runRead;
     nodes.btnSearch.onclick = runSearch;
 
     nodes.btnAll.onclick = async () => {
+        try { await assertAccount(); } catch (e) { log(e.message); return; }
         if (state.manualPaused || state.running || state.allRunning || state.busyCount > 0) {
             setManualPause(!state.manualPaused);
             return;
@@ -1711,10 +2112,20 @@ nodes.btnRead.onclick = runRead;
     // 页面启动后自动执行一次，避免刷新或脚本重新初始化时重复启动
     const autoRunAll = async () => {
         if (!CONFIG.autoRun?.enabled) return;
+        if (identitySource !== 'dashboard') {
+            nodes.panel.classList.remove('collapsed');
+            log('⚠️ 尚未识别 Rewards 页面账号，禁止自动执行；本页需要明确选择 Rewards 账号重新授权后手动操作');
+            return;
+        }
+        if (sessionStorage.getItem('mr_require_manual_start') === '1') {
+            nodes.panel.classList.remove('collapsed');
+            log('ℹ️ 缓存已清理，本标签页自动执行已关闭；请确认账号并重新授权后手动启动');
+            return;
+        }
         if (location.hostname !== 'rewards.bing.com' || !location.pathname.startsWith('/dashboard')) return;
 
         // sessionStorage 仅用于当前标签页，不是跨标签页的浏览器会话锁
-        const autoRunKey = 'mr_auto_run_started_' + getDateHyphen();
+        const autoRunKey = scopedKey('auto_run_' + getDateHyphen());
         if (sessionStorage.getItem(autoRunKey) === '1') {
             log('ℹ️ 当前标签页今天已自动启动过任务，可手动点击全部执行');
             return;
@@ -1737,6 +2148,7 @@ nodes.btnRead.onclick = runRead;
     // Init
     (async () => {
         try {
+            await assertAccount();
             loginCookie = await getCookies('https://login.live.com');
 
             console.log('[Rewards] 登录Cookie长度:', loginCookie.length);
@@ -1768,10 +2180,16 @@ nodes.btnRead.onclick = runRead;
             log('⚠️ 当前时间 00:00-08:00，Rewards 每日任务可能尚未刷新');
             log('💡 建议北京时间 08:00 后运行脚本，避免任务进度显示异常');
         }
-        log('🌟 脚本就绪 v1.0.6');
+        log('🌟 脚本就绪 v1.0.18');
         await autoRunAll().catch(e => log(`❌ 自动执行出错: ${e.message}`));
     })();
 
+    setInterval(() => {
+        assertAccount().catch(() => {});
+    }, 15000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) assertAccount().catch(() => {});
+    });
     setInterval(updateData, 60000);
 
 })();
