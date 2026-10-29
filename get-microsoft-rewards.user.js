@@ -67,6 +67,11 @@
             enabled: true,           // 是否启用暂停机制
             interval: 10,            // 每执行多少次搜索后暂停
             duration: 15 * 60 * 1000 // 暂停时长（毫秒），15分钟
+        },
+        // 自动执行配置：仅在 Rewards dashboard 页面首次加载时触发
+        autoRun: {
+            enabled: true,
+            delay: 5000              // 等待页面数据和登录状态稳定后再启动
         }
     };
 
@@ -1702,6 +1707,33 @@ nodes.btnRead.onclick = runRead;
             updateAllButton();
         }
     };
+
+    // 页面启动后自动执行一次，避免刷新或脚本重新初始化时重复启动
+    const autoRunAll = async () => {
+        if (!CONFIG.autoRun?.enabled) return;
+        if (location.hostname !== 'rewards.bing.com' || !location.pathname.startsWith('/dashboard')) return;
+
+        // sessionStorage 仅用于当前标签页，不是跨标签页的浏览器会话锁
+        const autoRunKey = 'mr_auto_run_started_' + getDateHyphen();
+        if (sessionStorage.getItem(autoRunKey) === '1') {
+            log('ℹ️ 当前标签页今天已自动启动过任务，可手动点击全部执行');
+            return;
+        }
+
+        log(`⏳ ${CONFIG.autoRun.delay / 1000} 秒后自动开始执行...`);
+        await sleep(CONFIG.autoRun.delay);
+        if (state.manualPaused || state.running || state.allRunning || state.busyCount > 0) return;
+        if (!dashboard || !state.accessToken || Date.now() >= state.accessTokenExpiresAt) {
+            log('⚠️ 自动执行已跳过：请先完成登录或授权，再手动点击全部执行');
+            return;
+        }
+        if (typeof nodes.btnAll?.onclick === 'function') {
+            sessionStorage.setItem(autoRunKey, '1');
+            nodes.panel.classList.remove('collapsed');
+            await nodes.btnAll.onclick();
+        }
+    };
+
     // Init
     (async () => {
         try {
@@ -1737,6 +1769,7 @@ nodes.btnRead.onclick = runRead;
             log('💡 建议北京时间 08:00 后运行脚本，避免任务进度显示异常');
         }
         log('🌟 脚本就绪 v1.0.6');
+        await autoRunAll().catch(e => log(`❌ 自动执行出错: ${e.message}`));
     })();
 
     setInterval(updateData, 60000);
