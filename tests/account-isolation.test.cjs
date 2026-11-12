@@ -10,7 +10,7 @@ function harness(storage = new Map([['refresh_token', 'legacy-token'], ['Config.
     const noop = () => {};
     const element = () => ({ textContent: '', style: {}, disabled: false, classList: { remove: noop }, replaceChildren: noop, appendChild: noop });
     const nodes = Object.fromEntries(['logBox', 'panel', 'account', 'points', 'pc', 'read', 'signStatus', 'level', 'pcBar', 'readBar', 'valPromo', 'btnAll', 'btnSearch', 'btnSign', 'btnRead', 'btnPromo', 'btnAuthSave'].map(k => [k, element()]));
-    const context = vm.createContext({ GM_registerMenuCommand: () => {}, GM_xmlhttpRequest: options => { options.onerror(); }, document: { createElement: element }, crypto: webcrypto, TextEncoder, getCookies: async () => cookie, GM_getValue: (k, d) => storage.has(k) ? storage.get(k) : d, GM_setValue: (k, v) => storage.set(k, v), nodes, log: noop, state: { running: true, accessToken: 'old-token' }, dashboard: {} });
+    const context = vm.createContext({ GM_registerMenuCommand: () => {}, GM_xmlhttpRequest: options => { options.onerror(); }, document: { createElement: element }, crypto: webcrypto, URL, TextEncoder, getCookies: async () => cookie, GM_getValue: (k, d) => storage.has(k) ? storage.get(k) : d, GM_setValue: (k, v) => storage.set(k, v), nodes, log: noop, state: { running: true, accessToken: 'old-token' }, dashboard: {} });
     const section = source.slice(source.indexOf('    let accountScope = null;'), source.indexOf('    // ========== 进度保存/恢复'));
     vm.runInContext(section + '\nglobalThis.api = { assertAccount, accountGet, accountSet, scopedKey, readAccountScope, dashboardIdentity, parseDashboard, pendingRequests };', context);
     return { context, storage, nodes, api: context.api, cookie: value => { cookie = value; } };
@@ -88,6 +88,82 @@ test('dashboard parsing supports script end, nested JSON, braces and escaped quo
         assert.equal(h.api.parseDashboard(html).userProfile.name, profile.name);
     }
     assert.equal(h.api.parseDashboard('var dashboard = {broken};'), null);
+});
+
+function flightHtml(records) {
+    const stream = records.map((r, i) => `${i.toString(16)}:${JSON.stringify(r)}\n`).join('');
+    const split = Math.floor(stream.length / 2);
+    return [stream.slice(0, split), stream.slice(split)].map(chunk =>
+        `<script>self.__next_f.push(${JSON.stringify([1, chunk])})</script>`).join('');
+}
+
+test('Flight parser joins chunks, rejects ambiguous balances and never evaluates code', () => {
+    const h = harness();
+    vm.runInContext('globalThis.parseFlight = parseFlightSnapshot;', h.context);
+    const html = flightHtml([{ children: { balance: 123, level: 2 } }, { model: { dailySetItems: [] } }]);
+    assert.equal(h.context.parseFlight(html).balance, 123);
+    assert.equal(h.context.parseFlight(html).level, 2);
+    assert.equal(h.context.parseFlight(html).dailyCount, 0);
+    assert.equal(h.context.parseFlight(flightHtml([{ balance: 1, level: 1 }, { balance: 2, level: 2 }])).balance, null);
+    assert.equal(h.context.parseFlight('<script>self.__next_f.push(globalThis.executed=true)</script>'), null);
+    assert.equal(h.context.executed, undefined);
+    assert.equal(h.context.parseFlight(null), null);
+});
+
+test('Flight missing identity remains read-only even with a legacy cookie', async () => {
+    const h = harness();
+    h.context.GM_xmlhttpRequest = options => options.onload({ status: 200,
+        responseText: flightHtml([{ balance: 123, level: 2 }]) });
+    await assert.rejects(h.api.assertAccount(), /唯一/);
+    assert.equal(h.nodes.points.textContent, '123');
+    assert.equal(h.nodes.level.textContent, '2');
+    assert.equal(h.nodes.btnAll.disabled, true);
+    assert.equal(h.nodes.btnAuthSave.disabled, true);
+    assert.equal(h.context.state.accessToken, null);
+    assert.throws(() => h.api.accountGet('refresh_token', ''));
+});
+
+test('Flight photo identity is scoped, stable across query changes and stops on account switch', async () => {
+    const h = harness();
+    const photo = id => `https://storage.live.com/users/0x${id}/myprofile/expressionprofile/profilephoto:UserTile?ck=rotating`;
+    let id = '00000000000000001111222233334444';
+    h.context.GM_xmlhttpRequest = options => options.onload({ status: 200, responseText:
+        flightHtml([{ profilePictureUrl: photo(id), children: { balance: 123, level: 2 } }]) });
+    await h.api.assertAccount();
+    const key = h.api.scopedKey('refresh_token');
+    assert.ok(!key.includes(id));
+    await h.api.assertAccount();
+    assert.equal(h.api.scopedKey('refresh_token'), key);
+    id = '00000000000000005555666677778888';
+    await assert.rejects(h.api.assertAccount(), /身份已变化/);
+    assert.equal(h.nodes.btnAll.disabled, true);
+});
+
+test('Flight rejects conflicting, non-Microsoft and zero photo identities', async () => {
+    for (const urls of [
+        ['https://evil.test/users/0x00000000000000001111222233334444/myprofile/expressionprofile/profilephoto:x'],
+        ['https://storage.live.com/users/0x00000000000000000000000000000000/myprofile/expressionprofile/profilephoto:x'],
+        ['1111222233334444', '5555666677778888'].map(id => `https://storage.live.com/users/0x0000000000000000${id}/myprofile/expressionprofile/profilephoto:x`)
+    ]) {
+        const h = harness();
+        h.context.GM_xmlhttpRequest = options => options.onload({ status: 200,
+            responseText: flightHtml(urls.map(profilePictureUrl => ({ profilePictureUrl }))) });
+        await assert.rejects(h.api.assertAccount());
+        assert.equal(h.nodes.btnAll.disabled, true);
+    }
+});
+
+test('structure diagnostics expose only counts and known marker flags', () => {
+    const h = harness();
+    vm.runInContext('globalThis.inspectStructure = identityPageStructure;', h.context);
+    const report = h.context.inspectStructure('<script>window.dashboard = JSON.parse("private-account-value");</script>');
+    assert.equal(report.scriptCount, 1);
+    assert.equal(report.markers.dashboardProperty, true);
+    assert.equal(report.markers.dashboardDeclaration, false);
+    assert.equal(report.markers.jsonParse, true);
+    assert.equal(report.dashboardParsed, false);
+    assert.ok(!JSON.stringify(report).includes('private-account-value'));
+    assert.equal(h.context.inspectStructure(null).htmlLength, 0);
 });
 
 test('Cookie API receives a normalized URL matching metadata paths', async () => {

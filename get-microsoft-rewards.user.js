@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards (修复/增强版)
 // @namespace    https://github.com/Muverix/Get-Microsoft-Rewards
-// @version      1.0.18
+// @version      1.0.21
 // @description  微软 Rewards 自动助手：集成本地自动搜索、每日活动与自动签到。基于原脚本二次开发，在 Gemini AI 辅助下优化多区域兼容与卡片过滤逻辑。
 // @author       Muverix
 // @license      MIT
@@ -183,6 +183,66 @@
         return null;
     }
 
+    let flightSnapshot = null;
+
+    // Flight 数据只做 JSON 解析，身份只接受服务端头像属性中的微软用户路径。
+    function parseFlightSnapshot(html) {
+        if (typeof html !== 'string' || html.length > 5000000) return null;
+        let stream = '';
+        let found = false;
+        const scripts = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi;
+        let match;
+        while ((match = scripts.exec(html))) {
+            const push = match[1].trim().match(/^self\.__next_f\.push\((\[[\s\S]*\])\)\s*;?$/);
+            if (!push) continue;
+            try {
+                const chunk = JSON.parse(push[1]);
+                if (chunk[0] === 1 && typeof chunk[1] === 'string') {
+                    found = true;
+                    stream += chunk[1];
+                }
+            } catch { /* 不执行脚本；未知编码留待后续适配。 */ }
+        }
+        if (!found) return null;
+        const balances = new Set(), levels = new Set(), photoIds = new Set();
+        let invalidPhoto = false;
+        let dailyItems = null;
+        let budget = 100000;
+        function visit(value, depth = 0) {
+            if (!value || typeof value !== 'object' || depth > 40 || --budget < 0) return;
+            if (!Array.isArray(value)) {
+                if (Object.hasOwn(value, 'profilePictureUrl')) {
+                    try {
+                        const url = new URL(value.profilePictureUrl);
+                        const id = url.pathname.match(/^\/users\/0x([0-9a-f]{32})\/myprofile\/expressionprofile\/profilephoto:/i);
+                        if (url.origin !== 'https://storage.live.com' || !id || /^0+$/.test(id[1])) invalidPhoto = true;
+                        else photoIds.add(id[1].toLowerCase());
+                    } catch { invalidPhoto = true; }
+                }
+                if (Number.isSafeInteger(value.balance) && value.balance >= 0
+                    && Number.isSafeInteger(value.level) && value.level > 0) {
+                    balances.add(value.balance);
+                    levels.add(value.level);
+                }
+                if (Array.isArray(value.dailySetItems)) dailyItems = value.dailySetItems;
+            }
+            for (const child of Object.values(value)) visit(child, depth + 1);
+        }
+        for (const line of stream.split('\n')) {
+            // 只读取独立 JSON 记录；不解引用、不执行模块或 Server Action。
+            const record = line.match(/^[0-9a-f]+:([\[{][\s\S]*)$/i);
+            if (record) {
+                try { visit(JSON.parse(record[1])); } catch { }
+            }
+        }
+        return {
+            identity: budget >= 0 && !invalidPhoto && photoIds.size === 1 ? `flight-photo:${[...photoIds][0]}` : null,
+            balance: balances.size === 1 ? [...balances][0] : null,
+            level: levels.size === 1 ? [...levels][0] : null,
+            dailyCount: dailyItems ? dailyItems.length : null
+        };
+    }
+
     // 优先使用服务端仪表板的稳定身份；兼容不能使用 GM_cookie 的环境。
     function dashboardIdentity(html) {
         const data = parseDashboard(html);
@@ -212,12 +272,21 @@
     async function readAccountScope() {
         let identity = null;
         // 首次选定来源后不切换来源，避免短暂接口异常造成错误账号空间。
-        if (!identitySource || identitySource === 'dashboard') {
+        if (!identitySource || identitySource === 'dashboard' || identitySource === 'flight') {
             try {
-                identity = dashboardIdentity(await fetchIdentityHtml());
-                if (identity) identitySource = 'dashboard';
+                const html = await fetchIdentityHtml();
+                identity = dashboardIdentity(html);
+                flightSnapshot = parseFlightSnapshot(html);
+                if (flightSnapshot) {
+                    if (identitySource === 'dashboard') throw new Error('Rewards 页面身份来源已变化，请刷新后重新授权');
+                    if (!flightSnapshot.identity) throw new Error('新版 Rewards 未返回唯一的微软用户头像身份；为避免串号，任务保持禁用');
+                    identity = flightSnapshot.identity;
+                    identitySource = 'flight';
+                } else if (identitySource === 'flight') {
+                    throw new Error('新版 Rewards 身份数据已消失，请刷新并检查登录');
+                } else if (identity) identitySource = 'dashboard';
             } catch (e) {
-                if (identitySource === 'dashboard') throw e;
+                if (flightSnapshot || identitySource === 'dashboard' || identitySource === 'flight') throw e;
             }
             if (identitySource === 'dashboard' && !identity) throw new Error('仪表板未返回账号身份，请确认 Rewards 已登录');
         }
@@ -243,8 +312,35 @@
         return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
     }
 
+    // 仅报告已知结构的存在性，不输出正文、脚本地址或属性值。
+    function identityPageStructure(html) {
+        const text = typeof html === 'string' ? html : '';
+        return {
+            htmlLength: text.length,
+            scriptCount: (text.match(/<script\b/gi) || []).length,
+            markers: {
+                dashboardDeclaration: /\b(?:var|let|const)\s+dashboard\s*=/.test(text),
+                dashboardProperty: /(?:window\.)?dashboard\s*=/.test(text),
+                initialState: /__INITIAL_STATE__/.test(text),
+                nextData: /__NEXT_DATA__/.test(text),
+                nextFlight: /__next_f/.test(text),
+                userProfile: /\buserProfile\b/.test(text),
+                userStatus: /\buserStatus\b/.test(text),
+                jsonParse: /JSON\.parse\s*\(/.test(text)
+            },
+            dashboardParsed: !!parseDashboard(text),
+            flightParsed: !!parseFlightSnapshot(text),
+            recognizedIdentity: !!dashboardIdentity(text) || !!parseFlightSnapshot(text)?.identity
+        };
+    }
+
     async function showIdentityDiagnostics() {
-        const report = { version: '1.0.18', cookieApi: typeof GM_cookie };
+        const report = { version: '1.0.21', cookieApi: typeof GM_cookie };
+        report.currentPage = {
+            host: location.hostname,
+            isDashboardPath: location.pathname === '/dashboard',
+            structure: identityPageStructure(document.documentElement?.outerHTML || '')
+        };
         nodes.panel.classList.remove('collapsed');
         nodes.diagnose.disabled = true;
         try {
@@ -276,8 +372,8 @@
                         const keys = obj => obj && typeof obj === 'object' ? Object.keys(obj).slice(0, 60) : [];
                         let host = '';
                         try { host = new URL(r.finalUrl).hostname; } catch { }
-                        resolve({ status: r.status, finalHost: host, dashboardParsed: !!data,
-                            recognizedIdentity: !!dashboardIdentity(r.responseText || ''),
+                        resolve({ status: r.status, finalHost: host, structure: identityPageStructure(r.responseText), dashboardParsed: !!data,
+                            recognizedIdentity: !!dashboardIdentity(r.responseText || '') || !!parseFlightSnapshot(r.responseText)?.identity,
                             rootFields: keys(data), profileFields: keys(data?.userProfile),
                             statusFields: keys(data?.userStatus), profileAttributeFields: keys(data?.userProfile?.attributes) });
                     },
@@ -320,8 +416,20 @@
         nodes.valPromo.textContent = '-';
         for (const button of [nodes.btnAll, nodes.btnSearch, nodes.btnSign, nodes.btnRead, nodes.btnPromo, nodes.btnAuthSave]) button.disabled = true;
         const notice = document.createElement('div');
-        notice.textContent = `⛔ 已暂停旧会话：${reason || '登录身份已变化'}。任务不会继续提交。`;
+        notice.textContent = flightSnapshot
+            ? `ℹ️ ${reason}。任务不会提交。`
+            : `⛔ 已停止任务：${reason || '登录身份无法确认'}。任务不会继续提交。`;
         nodes.logBox.appendChild(notice);
+        if (flightSnapshot) {
+            nodes.account.textContent = '新版 Rewards · 只读（身份未验证）';
+            nodes.points.textContent = flightSnapshot.balance === null ? '-' : String(flightSnapshot.balance);
+            nodes.level.textContent = flightSnapshot.level === null ? '-' : String(flightSnapshot.level);
+            nodes.signStatus.textContent = '未适配';
+            nodes.valPromo.textContent = '-';
+            const detail = document.createElement('div');
+            detail.textContent = '新版网页数据已读取；搜索、签到、阅读、活动及授权均保持禁用。此显示不表示账号身份已验证。';
+            nodes.logBox.appendChild(detail);
+        }
     }
 
     async function assertAccount() {
@@ -330,7 +438,10 @@
             identityCheck = (async () => {
                 try {
                     const current = await readAccountScope();
-                    if (accountScope && current !== accountScope) throw new Error('微软登录身份已变化');
+                    if (accountScope && current !== accountScope) {
+                        flightSnapshot = null;
+                        throw new Error('微软登录身份已变化');
+                    }
                     accountScope = current;
                 } catch (e) {
                     blockAccount(e.message);
@@ -1071,6 +1182,11 @@
                 }
             }
 
+            if (!dashData && identitySource === 'flight' && flightSnapshot) {
+                dashData = { balance: flightSnapshot.balance ?? 0, level: flightSnapshot.level ?? 1,
+                    userProfile: {}, promotions: [] };
+                log('ℹ️ 已读取新版网页积分；任务进度需要为当前 Rewards 账号完成授权后从移动接口读取');
+            }
             if (!dashData) {
                 if (authReceiving) {
                     log('ℹ️ 正在等待你确认授权账号；尚未兑换 Token，暂时无法读取接口数据');
@@ -1286,7 +1402,7 @@
         if (accountBlocked || !nodes.level) return;
 
         // 1. 等级与积分（优先显示金牌/银牌名称）
-        nodes.account.textContent = accountScope ? `会话 ${accountScope.slice(0, 8)}` : '未确认';
+        nodes.account.textContent = accountScope ? `${identitySource === 'flight' ? '新版会话' : '会话'} ${accountScope.slice(0, 8)}` : '未确认';
         nodes.level.textContent = state.levelName || `Lv.${state.level}`;
         nodes.points.textContent = (state.points || 0).toLocaleString();
         // 2. 搜索进度
@@ -2112,6 +2228,10 @@ nodes.btnRead.onclick = runRead;
     // 页面启动后自动执行一次，避免刷新或脚本重新初始化时重复启动
     const autoRunAll = async () => {
         if (!CONFIG.autoRun?.enabled) return;
+        if (identitySource === 'flight') {
+            log('ℹ️ 新版页面默认不自动执行，请确认授权账号后手动启动');
+            return;
+        }
         if (identitySource !== 'dashboard') {
             nodes.panel.classList.remove('collapsed');
             log('⚠️ 尚未识别 Rewards 页面账号，禁止自动执行；本页需要明确选择 Rewards 账号重新授权后手动操作');
@@ -2180,7 +2300,7 @@ nodes.btnRead.onclick = runRead;
             log('⚠️ 当前时间 00:00-08:00，Rewards 每日任务可能尚未刷新');
             log('💡 建议北京时间 08:00 后运行脚本，避免任务进度显示异常');
         }
-        log('🌟 脚本就绪 v1.0.18');
+        log('🌟 脚本就绪 v1.0.21');
         await autoRunAll().catch(e => log(`❌ 自动执行出错: ${e.message}`));
     })();
 
